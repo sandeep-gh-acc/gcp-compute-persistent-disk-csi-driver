@@ -293,16 +293,28 @@ func recoverPreemptionVgConflict(volumeGroupName, mainLvName, devicePath, staleV
 	// WARNING: If we run vgreduce --removemissing first on a partial cached LV (missing local SSD),
 	// LVM will forcefully destroy/delete the entire logical volume, resulting in complete data loss!
 	// Dissociating the cache first preserves the origin volume (and user data) intact on the GCE PD.
-	isCached, err := isLvCachedOnDevice(volumeGroupName, mainLvName, devicePath)
-	if err != nil {
-		klog.Errorf("Failed to check if stale volume %s/%s is cached: %v", volumeGroupName, mainLvName, err)
-	}
-	if isCached {
+	isCached, cacheStateErr := isLvCachedOnDevice(volumeGroupName, mainLvName, devicePath)
+	switch {
+	case cacheStateErr != nil:
+		// Cache state is undeterminable (e.g. lvs failed with no parseable output).
+		// The local SSD cache is ephemeral and is rebuilt on the freshly attached disk
+		// by the normal setup flow, so we proceed with recovery rather than block the
+		// volume. Attempt a best-effort HARD uncache first (--force -y, no flush):
+		// if the stale LV was cached this discards the dead cachevol and preserves the
+		// origin before the removemissing below (which would otherwise destroy a
+		// still-cached LV) — discarding the cache contents is safe because it is
+		// recreated downstream; if the LV was linear the uncache is a harmless no-op
+		// error we ignore.
+		klog.Warningf("Cache state of stale volume %s/%s is undeterminable: %v. Best-effort uncache, then removemissing and cache rebuild.", volumeGroupName, mainLvName, cacheStateErr)
+		if uncErr := uncacheLogicalVolume(volumeGroupName, mainLvName, configFilter); uncErr != nil {
+			klog.V(4).Infof("Best-effort uncache of %s/%s returned (expected if the LV is linear/uncached): %v", volumeGroupName, mainLvName, uncErr)
+		}
+	case isCached:
 		klog.Infof("Step 2: Dissociating (uncaching) stale volume %s/%s using device filter to preserve data", volumeGroupName, mainLvName)
 		if err := uncacheLogicalVolume(volumeGroupName, mainLvName, configFilter); err != nil {
 			return fmt.Errorf("failed to uncache stale volume %s/%s during preemption recovery: %w", volumeGroupName, mainLvName, err)
 		}
-	} else {
+	default:
 		klog.Infof("Stale volume %s/%s is not cached, skipping uncache step during preemption recovery", volumeGroupName, mainLvName)
 	}
 
@@ -611,7 +623,13 @@ func getVgInfoForPv(pvPath string) (string, string, error) {
 
 // isLvCachedOnDevice checks if the logical volume (LV) in the volume group (VG) is cached.
 // It queries LVM using 'lvs' with a custom field selection, returning true if the volume
-// is associated with a cache pool ('csi-fast'), and false otherwise.
+// is associated with a cache pool, and false otherwise.
+//
+// lvs warns-and-exits-nonzero when the cachevol PV is missing (the preemption case) but
+// still prints the LV's pool_lv on stdout, so we read the output even on a non-zero exit.
+// When the command failed AND produced no parseable rows the state is unknown, signalled by
+// a non-nil error; the caller treats that as "best-effort uncache, then proceed" so recovery
+// is never blocked while still protecting the origin of a possibly-cached LV.
 func isLvCachedOnDevice(vgName, lvName, pvPath string) (bool, error) {
 	resolvedPvPath, err := filepath.EvalSymlinks(pvPath)
 	if err != nil {
@@ -625,14 +643,22 @@ func isLvCachedOnDevice(vgName, lvName, pvPath string) (bool, error) {
 		"-o", "pool_lv",
 		"--config", configFilter,
 	}
-	output, err := common.RunCommand("" /* pipedCmd */, nil /* pipedCmdArg */, "lvs", args...)
+	output, err := common.RunCommandWithOutput("lvs", args...)
 	if err != nil {
-		// If lvs exits with a warning/error (which it always does when a PV is missing),
-		// we still want to parse the output. If the VG/LV genuinely doesn't exist,
-		// the output will be empty and we will correctly return false.
-		klog.V(4).Infof("lvs returned warning/error while checking cache on %s: %v. Parsing output anyway.", pvPath, err)
+		klog.V(4).Infof("lvs returned warning/error while checking cache on %s: %v", pvPath, err)
 	}
-	return strings.Contains(string(output), "csi-fast"), nil
+	return classifyCacheState(output, err)
+}
+
+// classifyCacheState decides cache presence from lvs output and its exit error.
+// A non-empty pool_lv carrying the cache suffix means the LV is cached. When the
+// command failed and produced no parseable output the state is unknown, so it
+// fails closed by returning an error.
+func classifyCacheState(lvsOutput []byte, runErr error) (bool, error) {
+	if strings.TrimSpace(string(lvsOutput)) == "" && runErr != nil {
+		return false, fmt.Errorf("unable to determine cache state: %w", runErr)
+	}
+	return strings.Contains(string(lvsOutput), cacheSuffix), nil
 }
 
 // mergeStaleVgIntoHost deactivates, uncaches, and reduces a stale Volume Group on the GCE PD,

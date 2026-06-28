@@ -1,6 +1,7 @@
 package gceGCEDriver
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -169,6 +170,65 @@ func TestIsValidVGName(t *testing.T) {
 			actual := isValidVGName(tc.vgName)
 			if actual != tc.expected {
 				t.Errorf("isValidVGName(%q) = %v; want %v", tc.vgName, actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestClassifyCacheState(t *testing.T) {
+	boom := errors.New("lvs exit status 5")
+	testCases := []struct {
+		name       string
+		output     string
+		runErr     error
+		wantCached bool
+		wantErr    bool
+	}{
+		{
+			name:       "cached, clean exit",
+			output:     "  pvc-123-" + cacheSuffix + "_cpool\n",
+			runErr:     nil,
+			wantCached: true,
+		},
+		{
+			name:       "cached, warned-and-exited-nonzero on missing PV",
+			output:     "  WARNING: VG is missing PV\n  pvc-123-" + cacheSuffix + "_cpool\n",
+			runErr:     boom,
+			wantCached: true,
+		},
+		{
+			name:       "linear volume, clean exit, empty pool_lv",
+			output:     "  \n",
+			runErr:     nil,
+			wantCached: false,
+		},
+		{
+			name:       "lv genuinely absent, clean exit, no rows",
+			output:     "",
+			runErr:     nil,
+			wantCached: false,
+		},
+		{
+			name:    "unknown state: command failed with no output -> fail closed",
+			output:  "",
+			runErr:  boom,
+			wantErr: true,
+		},
+		{
+			name:    "unknown state: only whitespace output on failure -> fail closed",
+			output:  "   \n",
+			runErr:  boom,
+			wantErr: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cached, err := classifyCacheState([]byte(tc.output), tc.runErr)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("classifyCacheState err = %v; wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && cached != tc.wantCached {
+				t.Errorf("classifyCacheState cached = %v; want %v", cached, tc.wantCached)
 			}
 		})
 	}

@@ -35,6 +35,22 @@ func RunCommand(pipeCmd string, pipeCmdArg []string, cmd1 string, execCmdArgs ..
 	return output, nil
 }
 
+// RunCommandWithOutput is like RunCommand but always returns the combined
+// command output, even when the command exits non-zero. Reporting tools such
+// as the LVM CLI warn-and-exit-nonzero when a PV is missing yet still print the
+// rows callers need. Plain RunCommand discards those bytes on error, so callers
+// that must inspect output regardless of exit status use this variant.
+func RunCommandWithOutput(cmd1 string, execCmdArgs ...string) ([]byte, error) {
+	execCmd1 := exec.Command(cmd1, execCmdArgs...)
+	output, err := execCmd1.CombinedOutput()
+	if err != nil {
+		if err = checkError(err, *execCmd1); err != nil {
+			return output, fmt.Errorf("%s %s failed: %w; output: %s", cmd1, strings.Join(execCmdArgs, " "), err, string(output))
+		}
+	}
+	return output, nil
+}
+
 func checkError(err error, execCmd exec.Cmd) error {
 	if err.Error() == errNoChildProcesses {
 		if execCmd.ProcessState.Success() {
